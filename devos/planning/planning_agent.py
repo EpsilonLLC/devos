@@ -17,6 +17,63 @@ load_dotenv(encoding="utf-8-sig")
 _agent_console = Console(highlight=False, force_terminal=True, legacy_windows=False)
 
 # ---------------------------------------------------------------------------
+# Phase 5 prompt
+# ---------------------------------------------------------------------------
+
+_PHASE5_ACCEPTANCE_SYSTEM = """\
+You are a product specification agent in Phase 5: Acceptance Criteria.
+
+Input: spec/01_functional.md, spec/03_api_contract.md, and the user's definition of done.
+Your job: write compact acceptance criteria for every feature in the spec.
+
+STRICT OUTPUT LIMITS — stay within these or you will run out of tokens:
+- done_criteria: exactly 5 items per feature (3 happy path + 2 error cases)
+- pytest_stubs: exactly 4 items per feature — one per major scenario
+- edge_case_coverage: one entry per edge case listed in the feature's "Edge cases" section
+  (copy the exact edge case text from the spec — do NOT add extra ones)
+
+Quality rules:
+- Done criteria must be verifiable statements referencing HTTP codes or field names
+  Good: "POST /api/v1/tasks returns 201 with task.id UUID and status 'todo'"
+  Bad:  "Task creation works correctly"
+- Pytest stub names must be scenario-specific
+  Good: test_create_task_rejects_empty_title
+  Bad:  test_task_creation_works
+- Every edge case from 01_functional.md MUST map to a test — do NOT skip any
+- The user's definition of done must influence done_criteria
+
+Output: a JSON array wrapped in <ACCEPTANCE_JSON>...</ACCEPTANCE_JSON> tags.
+One compact object per feature, in feature order (F-001 through F-007):
+
+[
+  {
+    "feature_id": "F-001",
+    "feature_name": "User Authentication",
+    "done_criteria": [
+      "POST /api/v1/auth/signup with valid email+password returns 200 with {user: {id, email}, token: string}",
+      "POST /api/v1/auth/login with correct credentials returns 200 with non-empty token",
+      "GET /api/v1/auth/session with valid Bearer token returns 200 with user object",
+      "POST /api/v1/auth/signup with duplicate email returns 409 CONFLICT code",
+      "Any protected endpoint without Authorization header returns 401 UNAUTHORIZED"
+    ],
+    "pytest_stubs": [
+      {"name": "test_signup_creates_user_and_returns_token", "docstring": "POST /signup with valid unique email and password returns 200 with user.id UUID and token string."},
+      {"name": "test_signup_rejects_duplicate_email", "docstring": "POST /signup with already-registered email returns 409 with CONFLICT code."},
+      {"name": "test_login_correct_credentials_returns_token", "docstring": "POST /login with correct email and password returns 200 with valid non-empty token."},
+      {"name": "test_protected_endpoint_rejects_missing_auth_header", "docstring": "GET on any auth-required endpoint without Authorization header returns 401 UNAUTHORIZED."}
+    ],
+    "edge_case_coverage": [
+      {"edge_case": "Email already registered", "test": "test_signup_rejects_duplicate_email"},
+      {"edge_case": "Wrong password at login", "test": "test_login_rejects_wrong_password"},
+      {"edge_case": "Non-existent email at login", "test": "test_login_rejects_unknown_email"}
+    ]
+  }
+]
+
+After the closing </ACCEPTANCE_JSON> tag, output: <<<PHASE_5_COMPLETE>>>
+"""
+
+# ---------------------------------------------------------------------------
 # Phase 4 prompts
 # ---------------------------------------------------------------------------
 
@@ -569,6 +626,81 @@ class PlanningAgent:
 
         return self._parse_api_contract(response_text)
 
+    def ask_acceptance_question(self, question: str) -> str:
+        """
+        Ask exactly 1 acceptance question via Rich CLI. No LLM call.
+
+        question — the question string to present to the user.
+        Returns the user's answer; falls back to a sensible default in
+        non-interactive mode (EOFError on stdin).
+        """
+        _agent_console.print(
+            Panel(
+                "[bold]One question before we derive acceptance criteria.[/bold]",
+                title="[bold cyan]Acceptance Criteria[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+        _agent_console.print(f"\n[bold]Q:[/bold] {question}")
+        try:
+            answer = Prompt.ask("  Your answer")
+        except EOFError:
+            answer = ""
+        return answer.strip() or (
+            "All 7 features must be fully implemented with passing tests. "
+            "Every API endpoint must return the documented status codes. "
+            "No feature may have partial implementation."
+        )
+
+    def derive_acceptance(
+        self,
+        functional_spec: str,
+        api_contract: str,
+        user_answer: str,
+    ) -> list:
+        """
+        Phase 5 — Acceptance criteria derivation.
+
+        Fresh LLM context. Reads 01_functional.md + 03_api_contract.md content
+        (loaded from disk by the caller — never from Phase 4 memory).
+
+        Returns list of AcceptanceCriteria Pydantic objects, one per feature.
+        """
+        user_content = (
+            "Here is spec/01_functional.md:\n\n"
+            f"{functional_spec}\n\n"
+            "Here is spec/03_api_contract.md:\n\n"
+            f"{api_contract}\n\n"
+            f"User's definition of done: {user_answer}\n\n"
+            "Derive acceptance criteria for every feature. Every edge case from "
+            "01_functional.md must appear in the edge_case_coverage table. "
+            "Pytest stub names must be scenario-specific, not generic."
+        )
+
+        message = self._client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8192,
+            system=_PHASE5_ACCEPTANCE_SYSTEM,
+            messages=[{"role": "user", "content": user_content}],
+        )
+
+        response_text = message.content[0].text
+
+        # Phase 5 generates a very large JSON block; the model sometimes fills
+        # max_tokens with the JSON itself and omits the trailing marker.
+        # We accept the response if the JSON block is present and parseable.
+        has_json = "<ACCEPTANCE_JSON>" in response_text
+        has_marker = "<<<PHASE_5_COMPLETE>>>" in response_text
+
+        if not has_json and not has_marker:
+            raise ValueError(
+                "Phase 5: neither <ACCEPTANCE_JSON> block nor "
+                "<<<PHASE_5_COMPLETE>>> marker found in LLM response.\n"
+                f"Response was:\n{response_text}"
+            )
+
+        return self._parse_acceptance(response_text)
+
     def ask_architecture_questions(self, questions: list[str]) -> list[str]:
         """
         Present exactly 2 architecture questions to the user via Rich CLI.
@@ -972,6 +1104,79 @@ class PlanningAgent:
                 stack = None
 
         return components, stack
+
+    def _parse_acceptance(self, text: str) -> list:
+        """Extract ACCEPTANCE_JSON from the LLM response.
+
+        Handles two cases:
+        1. Clean response with closing </ACCEPTANCE_JSON> tag.
+        2. Truncated response where max_tokens cut off the closing tag — we
+           attempt to recover by finding the opening tag and trimming to the
+           last complete JSON object.
+        """
+        from devos.planning.spec_generator import (
+            AcceptanceCriteria, PytestStub, EdgeCaseMapping
+        )
+
+        match = re.search(
+            r"<ACCEPTANCE_JSON>(.*?)</ACCEPTANCE_JSON>",
+            text,
+            re.DOTALL,
+        )
+        if not match:
+            # Attempt recovery: find the opening tag and parse up to the last ']'
+            open_match = re.search(r"<ACCEPTANCE_JSON>(.*)", text, re.DOTALL)
+            if not open_match:
+                raise ValueError(
+                    "Could not find <ACCEPTANCE_JSON> opening tag in LLM response.\n"
+                    f"Response was:\n{text[:500]}"
+                )
+            raw = open_match.group(1)
+            # Trim to the last complete top-level object by finding the last ']'
+            last_bracket = raw.rfind("]")
+            if last_bracket == -1:
+                raise ValueError(
+                    "ACCEPTANCE_JSON: no closing ']' found even in recovery mode.\n"
+                    f"Partial content was:\n{raw[:500]}"
+                )
+            raw_json = raw[: last_bracket + 1].strip()
+        else:
+            raw_json = match.group(1).strip()
+
+        try:
+            data = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Failed to parse ACCEPTANCE_JSON: {exc}\nRaw JSON:\n{raw_json}"
+            ) from exc
+
+        if not isinstance(data, list):
+            raise ValueError("ACCEPTANCE_JSON must be a JSON array")
+
+        criteria: list[AcceptanceCriteria] = []
+        for item in data:
+            stubs = [
+                PytestStub(name=s["name"], docstring=s["docstring"])
+                for s in item.get("pytest_stubs", [])
+            ]
+            edge_coverage = [
+                EdgeCaseMapping(
+                    edge_case=m["edge_case"],
+                    test=m["test"],
+                )
+                for m in item.get("edge_case_coverage", [])
+            ]
+            criteria.append(
+                AcceptanceCriteria(
+                    feature_id=item["feature_id"],
+                    feature_name=item["feature_name"],
+                    done_criteria=item.get("done_criteria", []),
+                    pytest_stubs=stubs,
+                    edge_case_coverage=edge_coverage,
+                )
+            )
+
+        return criteria
 
     def _parse_arch_constraints(self, text: str) -> "ArchConstraints":
         """Extract CONSTRAINTS_JSON from the LLM response."""

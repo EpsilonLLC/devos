@@ -48,6 +48,7 @@ def _persist_state(state: InterviewState, devos_dir: Path) -> None:
         "stack": state.stack.model_dump() if state.stack else None,
         "components": [c.model_dump() for c in state.components],
         "arch_constraints": state.arch_constraints.model_dump() if state.arch_constraints else None,
+        "acceptance_criteria": [ac.model_dump() for ac in state.acceptance_criteria],
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -927,15 +928,134 @@ class Phase4_Architecture:
 
 
 class Phase5_Acceptance:
+    """Derive acceptance criteria from spec files; write spec/05_acceptance.md."""
+
     name = "phase-5-acceptance"
 
     def __init__(self, state: InterviewState) -> None:
         self._state = state
+        self._devos_dir = Path.cwd() / ".devos"
+        self._agent = PlanningAgent()
+        self._gen = SpecGenerator()
 
     def run(self) -> InterviewState:
-        console.print("[dim]Phase 5 (Acceptance) — not yet implemented[/dim]")
+        console.print(
+            Panel(
+                "[bold cyan]Phase 5 — Acceptance Criteria[/bold cyan]\n"
+                "We'll derive verifiable done criteria and test stubs for every feature.",
+                title="[bold]DevOS[/bold]",
+                border_style="cyan",
+            )
+        )
+
+        # ── Fresh context from disk — never from Phase 4 memory ───────────
+        functional_spec_path = Path.cwd() / "spec" / "01_functional.md"
+        api_contract_path = Path.cwd() / "spec" / "03_api_contract.md"
+
+        if not functional_spec_path.exists():
+            raise FileNotFoundError(
+                "spec/01_functional.md not found. Run Phase 2 first."
+            )
+        if not api_contract_path.exists():
+            raise FileNotFoundError(
+                "spec/03_api_contract.md not found. Run Phase 3 first."
+            )
+
+        functional_spec = functional_spec_path.read_text(encoding="utf-8")
+        api_contract = api_contract_path.read_text(encoding="utf-8")
+
+        # ── Step 1: Ask exactly 1 question ────────────────────────────────
+        user_answer = self._agent.ask_acceptance_question(
+            "What's your definition of done for this version?"
+        )
+        _persist_state(self._state, self._devos_dir)
+
+        # ── Step 2: Derive acceptance criteria ────────────────────────────
+        console.print()
+        with Live(
+            Text("  Deriving acceptance criteria from spec...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            criteria = self._agent.derive_acceptance(
+                functional_spec, api_contract, user_answer
+            )
+
+        # ── Step 3: Show per-feature done criteria for confirmation ───────
+        criteria = self._confirm_criteria(criteria)
+        self._state.acceptance_criteria = criteria
+        _persist_state(self._state, self._devos_dir)
+
+        # ── Step 4: Write spec/05_acceptance.md ───────────────────────────
+        output_dir = Path.cwd()
+        with Live(
+            Text("  Writing spec/05_acceptance.md...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            spec_path = self._gen.write_acceptance(self._state, output_dir)
+
+        console.print(
+            Panel(
+                f"[green]OK[/green] Written: [bold]{spec_path.relative_to(output_dir)}[/bold]",
+                border_style="green",
+            )
+        )
+
         self._state.current_phase = 5
+        console.print("\n[bold green]Phase 5 complete.[/bold green]\n")
         return self._state
+
+    # ------------------------------------------------------------------
+    # Per-feature done criteria confirmation
+    # ------------------------------------------------------------------
+
+    def _confirm_criteria(self, criteria: list) -> list:
+        """Show done criteria counts per feature and ask for confirmation."""
+        self._print_criteria_summary(criteria)
+
+        try:
+            confirmed = Confirm.ask(
+                "\n[bold]Confirm these acceptance criteria?[/bold]", default=True
+            )
+        except EOFError:
+            return criteria
+
+        if confirmed:
+            return criteria
+
+        console.print(
+            Panel(
+                "[yellow]Criteria are derived from the spec.\n"
+                "Accept and edit spec/05_acceptance.md directly after it is written.[/yellow]",
+                border_style="yellow",
+            )
+        )
+        return criteria
+
+    def _print_criteria_summary(self, criteria: list) -> None:
+        lines = [
+            "  [bold]Feature[/bold]".ljust(34)
+            + "[bold]Done criteria[/bold]  [bold]Tests[/bold]  [bold]Edge cases[/bold]",
+            "  " + "-" * 62,
+        ]
+        for ac in criteria:
+            fid_name = f"{ac.feature_id}: {ac.feature_name}"
+            lines.append(
+                f"  {fid_name[:32].ljust(32)}"
+                f"  {len(ac.done_criteria):>5}"
+                f"       {len(ac.pytest_stubs):>3}"
+                f"       {len(ac.edge_case_coverage):>5}"
+            )
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold cyan]Acceptance criteria summary[/bold cyan]",
+                border_style="cyan",
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1003,10 +1123,12 @@ class InterviewStateMachine:
                     ],
                     "spec(phase-4): architecture + constraints",
                 )
-
-            # Stop once Phase 4 is complete (Phase 5 not yet implemented)
-            if state.current_phase >= 4:
-                break
+            elif phase.name == "phase-5-acceptance":
+                self._commit_spec(
+                    [Path.cwd() / "spec" / "05_acceptance.md"],
+                    "spec(phase-5): acceptance criteria",
+                )
+                self._print_completion_banner()
 
         return state
 
@@ -1019,7 +1141,8 @@ class InterviewStateMachine:
 
     def _load_state(self) -> InterviewState | None:
         from devos.planning.spec_generator import (
-            Feature, Table, Endpoint, Component, ArchConstraints, TechStack
+            Feature, Table, Endpoint, Component, ArchConstraints, TechStack,
+            AcceptanceCriteria, PytestStub, EdgeCaseMapping,
         )
 
         path = self._devos_dir / "interview_state.json"
@@ -1090,9 +1213,34 @@ class InterviewStateMachine:
                 except Exception:
                     pass
 
+            # Restore acceptance_criteria
+            acceptance_criteria: list[AcceptanceCriteria] = []
+            for ac_item in data.get("acceptance_criteria", []):
+                try:
+                    stubs = [
+                        PytestStub(**s) for s in ac_item.get("pytest_stubs", [])
+                    ]
+                    edge_cov = [
+                        EdgeCaseMapping(**m)
+                        for m in ac_item.get("edge_case_coverage", [])
+                    ]
+                    acceptance_criteria.append(
+                        AcceptanceCriteria(
+                            feature_id=ac_item["feature_id"],
+                            feature_name=ac_item["feature_name"],
+                            done_criteria=ac_item.get("done_criteria", []),
+                            pytest_stubs=stubs,
+                            edge_case_coverage=edge_cov,
+                        )
+                    )
+                except Exception:
+                    pass
+
             loaded_phase = data.get("current_phase", 0)
 
             # Sanity checks: phase counter is only valid when output was produced.
+            if loaded_phase >= 5 and not acceptance_criteria:
+                loaded_phase = 4  # Phase 5 was never actually completed
             if loaded_phase >= 4 and not components:
                 loaded_phase = 3  # Phase 4 was never actually completed
             if loaded_phase >= 3 and not tables:
@@ -1119,9 +1267,40 @@ class InterviewStateMachine:
                 stack=stack,
                 components=components,
                 arch_constraints=arch_constraints,
+                acceptance_criteria=acceptance_criteria,
             )
         except Exception:
             return None
+
+    # ------------------------------------------------------------------
+    # Completion banner
+    # ------------------------------------------------------------------
+
+    def _print_completion_banner(self) -> None:
+        spec_files = [
+            Path.cwd() / "spec" / "00_product.md",
+            Path.cwd() / "spec" / "01_functional.md",
+            Path.cwd() / "spec" / "02_data_model.md",
+            Path.cwd() / "spec" / "03_api_contract.md",
+            Path.cwd() / "spec" / "04_components.md",
+            Path.cwd() / "spec" / "05_acceptance.md",
+        ]
+        lines = ["[bold green]All 5 phases complete. Full spec written to spec/[/bold green]", ""]
+        for p in spec_files:
+            if p.exists():
+                line_count = len(p.read_text(encoding="utf-8").splitlines())
+                rel = str(p.relative_to(Path.cwd())).replace("\\", "/")
+                lines.append(f"  [green]OK[/green]  [bold]{rel}[/bold]  [dim]({line_count} lines)[/dim]")
+            else:
+                rel = str(p.relative_to(Path.cwd())).replace("\\", "/")
+                lines.append(f"  [red]--[/red]  {rel}  [dim](missing)[/dim]")
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold green]DevOS — Spec Complete[/bold green]",
+                border_style="green",
+            )
+        )
 
     # ------------------------------------------------------------------
     # Git integration

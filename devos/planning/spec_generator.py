@@ -75,6 +75,24 @@ class ArchConstraints(BaseModel):
     non_functional: list[str] = []
 
 
+class PytestStub(BaseModel):
+    name: str        # e.g. test_signup_rejects_duplicate_email
+    docstring: str   # one-line description of what this test verifies
+
+
+class EdgeCaseMapping(BaseModel):
+    edge_case: str   # exact text from feature's edge_cases list
+    test: str        # pytest function name that covers this case
+
+
+class AcceptanceCriteria(BaseModel):
+    feature_id: str                         # F-001 … F-007
+    feature_name: str
+    done_criteria: list[str]                # Numbered, verifiable conditions
+    pytest_stubs: list[PytestStub]
+    edge_case_coverage: list[EdgeCaseMapping]
+
+
 @dataclass
 class InterviewState:
     idea: str
@@ -92,6 +110,7 @@ class InterviewState:
     constraints: list[str] = field(default_factory=list)
     components: list[Component] = field(default_factory=list)
     arch_constraints: Optional[ArchConstraints] = None
+    acceptance_criteria: list[AcceptanceCriteria] = field(default_factory=list)
     current_phase: int = 0
 
 
@@ -101,6 +120,14 @@ class InterviewState:
 
 class SpecGenerator:
     """Writes structured spec files from an InterviewState."""
+
+    def write_acceptance(self, state: InterviewState, output_dir: Path) -> Path:
+        """Write spec/05_acceptance.md and return its path."""
+        spec_dir = output_dir / "spec"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        path = spec_dir / "05_acceptance.md"
+        path.write_text(self._render_acceptance(state), encoding="utf-8")
+        return path
 
     def write_components(self, state: InterviewState, output_dir: Path) -> Path:
         """Write spec/04_components.md and return its path."""
@@ -159,6 +186,53 @@ class SpecGenerator:
     # ------------------------------------------------------------------
     # Rendering
     # ------------------------------------------------------------------
+
+    def _render_acceptance(self, state: InterviewState) -> str:
+        lines: list[str] = ["# Acceptance criteria", ""]
+
+        for ac in state.acceptance_criteria:
+            # Strip any leading "F-00X: " prefix from feature_id if already there
+            fid = ac.feature_id  # e.g. "F-001"
+            # Derive numeric suffix for AC label: AC-F001, AC-F002, etc.
+            ac_label = f"AC-{fid.replace('-', '')}"  # AC-F001
+
+            lines += [
+                "---",
+                f"### {ac_label}: {ac.feature_name}",
+                f"**Feature:** {fid}",
+                "**Status:** required",
+                "",
+                "**Done criteria:**",
+            ]
+            for criterion in ac.done_criteria:
+                # Ensure each criterion starts with "- [ ]"
+                clean = criterion.lstrip("0123456789.- \t")
+                lines.append(f"- [ ] {clean}")
+            lines.append("")
+
+            lines.append("**Behavioral tests:**")
+            lines.append("```python")
+            for stub in ac.pytest_stubs:
+                lines.append(f'def {stub.name}():')
+                lines.append(f'    """{stub.docstring}"""')
+                lines.append("    ...")
+                lines.append("")
+            lines.append("```")
+            lines.append("")
+
+            lines.append("**Edge case coverage required:**")
+            if ac.edge_case_coverage:
+                lines.append("| Edge case | Test name |")
+                lines.append("|-----------|-----------|")
+                for mapping in ac.edge_case_coverage:
+                    ec = mapping.edge_case.replace("|", "\\|")
+                    test = mapping.test
+                    lines.append(f"| {ec} | `{test}` |")
+            else:
+                lines.append("- _(no edge cases defined for this feature)_")
+            lines += ["", "---", ""]
+
+        return "\n".join(lines)
 
     def _render_product(self, state: InterviewState) -> str:
         lines: list[str] = ["# Product", ""]
