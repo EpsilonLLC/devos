@@ -1,0 +1,9 @@
+﻿.env
+.devos/
+__pycache__/
+*.egg-info/
+*.pyc
+.venv/
+dist/
+build/
+spec/
