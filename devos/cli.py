@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ import click
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
+from rich.table import Table as RichTable
 
 console = Console(highlight=False)
 
@@ -74,9 +76,139 @@ def new(idea: str | None) -> None:
         sys.exit(1)
 
 
+@cli.command()
+def build() -> None:
+    """Parse the spec and generate .devos/task_graph.json."""
+    from devos.decomposition.spec_parser import SpecParser, SpecValidationError
+    from devos.decomposition.dependency_graph import DependencyGraph
+    from devos.decomposition.task_graph import TaskGraph
+
+    spec_dir = Path.cwd() / "spec"
+    devos_dir = Path.cwd() / ".devos"
+    output_path = devos_dir / "task_graph.json"
+
+    if not spec_dir.exists():
+        console.print(
+            Panel(
+                "[red]No spec/ directory found in the current working directory.[/red]\n"
+                "Run [bold]devos new[/bold] to generate the spec first.",
+                title="[bold red]Build failed[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    console.print(
+        Panel(
+            "[bold cyan]DevOS Build[/bold cyan] — Decomposition Layer",
+            border_style="cyan",
+        )
+    )
+
+    # ── Step 1: Parse spec ────────────────────────────────────────────
+    parser = SpecParser()
+    try:
+        with console.status("[cyan]Parsing spec files...[/cyan]"):
+            parsed_spec = parser.parse(spec_dir)
+    except SpecValidationError as exc:
+        console.print(
+            Panel(
+                f"[red]{exc}[/red]",
+                title="[bold red]Spec validation failed[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+    except FileNotFoundError as exc:
+        console.print(
+            Panel(
+                f"[red]Missing spec file:[/red] {exc.filename}",
+                title="[bold red]Build failed[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    console.print(
+        f"[green]✓[/green] Spec parsed — "
+        f"[bold]{len(parsed_spec.features)}[/bold] features  "
+        f"[bold]{len(parsed_spec.tables)}[/bold] tables  "
+        f"[bold]{len(parsed_spec.endpoints)}[/bold] endpoints  "
+        f"[bold]{len(parsed_spec.components)}[/bold] components"
+    )
+
+    # ── Step 2: Build dependency graph ────────────────────────────────
+    with console.status("[cyan]Building dependency graph...[/cyan]"):
+        dep_graph = DependencyGraph.build(parsed_spec)
+
+    console.print(
+        f"[green]✓[/green] Dependency graph — "
+        f"[bold]{len(dep_graph.tasks)}[/bold] tasks"
+    )
+
+    # ── Step 3: Compute spec hash ─────────────────────────────────────
+    spec_hash = _compute_spec_hash(spec_dir)
+
+    # ── Step 4: Assign waves and write graph ──────────────────────────
+    with console.status("[cyan]Assigning execution waves...[/cyan]"):
+        task_graph = TaskGraph.build(dep_graph)
+        task_graph.write(output_path, spec_hash)
+
+    # ── Step 5: Print summary table ───────────────────────────────────
+    table = RichTable(
+        title="Task Graph",
+        show_header=True,
+        header_style="bold cyan",
+        border_style="dim",
+    )
+    table.add_column("Wave", style="bold cyan", justify="center", width=6)
+    table.add_column("Task ID", style="bold", width=8)
+    table.add_column("Name", width=24)
+    table.add_column("Component", width=12)
+    table.add_column("Depends on", width=20)
+
+    for wave in task_graph.waves:
+        for task in sorted(wave.tasks, key=lambda t: t.id):
+            deps = ", ".join(task.depends_on) if task.depends_on else "[dim]—[/dim]"
+            table.add_row(
+                str(wave.wave),
+                task.id,
+                task.name,
+                task.component,
+                deps,
+            )
+
+    console.print(table)
+    console.print(
+        Panel(
+            f"[bold green].devos/task_graph.json written[/bold green]\n"
+            f"[bold]{len(dep_graph.tasks)}[/bold] tasks across "
+            f"[bold]{len(task_graph.waves)}[/bold] waves\n"
+            f"[dim]spec_hash: {spec_hash[:16]}...[/dim]",
+            border_style="green",
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _compute_spec_hash(spec_dir: Path) -> str:
+    """SHA-256 of all 6 spec files concatenated in deterministic order."""
+    spec_files = [
+        spec_dir / "00_product.md",
+        spec_dir / "01_functional.md",
+        spec_dir / "02_data_model.md",
+        spec_dir / "03_api_contract.md",
+        spec_dir / "04_components.md",
+        spec_dir / "05_acceptance.md",
+    ]
+    hasher = hashlib.sha256()
+    for f in spec_files:
+        hasher.update(f.read_bytes())
+    return hasher.hexdigest()
 
 def _prompt_for_idea() -> str:
     """Interactively prompt the user for an idea with validation."""
