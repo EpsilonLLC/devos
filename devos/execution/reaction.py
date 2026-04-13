@@ -59,12 +59,21 @@ class ReactionEngine:
 
     # ── Public reactions ───────────────────────────────────────────────────────
 
-    def on_complete(self, session: SessionState, task) -> DistilledSummary:
-        """Distill output, write summary, remove worktree, update state.
+    def on_complete(
+        self,
+        session: SessionState,
+        task,
+        remove_worktree: bool = True,
+    ) -> DistilledSummary:
+        """Distill output, write summary, optionally remove worktree, update state.
 
         Args:
-            session: Terminal SessionState with status="complete".
-            task:    Task dataclass for name / id lookup.
+            session:          Terminal SessionState with status="complete".
+            task:             Task dataclass for name / id lookup.
+            remove_worktree:  When True (default, single-task mode), the worktree
+                              is removed after distillation.  Set to False in wave
+                              mode so the synthesis layer can read files before
+                              the merger cleans up.
 
         Returns:
             DistilledSummary written to .devos/summaries/{task_id}.md.
@@ -82,12 +91,13 @@ class ReactionEngine:
                 f"Distillation failed for {task.id}: {exc}"
             ) from exc
 
-        try:
-            self._worktree_manager.remove(task.id)
-        except Exception as exc:
-            raise ReactionError(
-                f"Worktree removal failed for {task.id}: {exc}"
-            ) from exc
+        if remove_worktree:
+            try:
+                self._worktree_manager.remove(task.id)
+            except Exception as exc:
+                raise ReactionError(
+                    f"Worktree removal failed for {task.id}: {exc}"
+                ) from exc
 
         session.status = "complete"
         write_state_json(

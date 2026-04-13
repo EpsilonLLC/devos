@@ -183,6 +183,46 @@ class MemoryDistiller:
         return out_path
 
 
+# ── Public helpers ──────────────────────────────────────────────────────────────
+
+
+def load_summary(md_path: Path) -> "DistilledSummary":
+    """Parse a previously written summary .md file into a DistilledSummary.
+
+    Does NOT call the LLM — reads and parses the markdown from disk.  The
+    header line ``# Task summary: {task_id} — {task_name}`` is used to
+    recover the task identifiers; the stem of ``md_path`` is used as a
+    fallback for task_id if the header is absent or unparseable.
+
+    Args:
+        md_path: Absolute path to a ``.devos/summaries/{task_id}.md`` file.
+
+    Returns:
+        Populated DistilledSummary.  Sections absent from the file default
+        to empty lists (or None for deviations / outstanding).
+
+    Raises:
+        OSError: If the file cannot be read.
+    """
+    markdown = md_path.read_text(encoding="utf-8")
+    token_estimate = len(markdown) // 4
+
+    # Recover task_id and task_name from the header line.
+    task_id: str = md_path.stem
+    task_name: str = ""
+    for line in markdown.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("# Task summary:"):
+            rest = stripped[len("# Task summary:"):].strip()
+            if " \u2014 " in rest:
+                task_id, task_name = rest.split(" \u2014 ", 1)
+                task_id = task_id.strip()
+                task_name = task_name.strip()
+            break
+
+    return _parse_summary(task_id, task_name, markdown, token_estimate)
+
+
 # ── Private helpers ─────────────────────────────────────────────────────────────
 
 def _parse_summary(

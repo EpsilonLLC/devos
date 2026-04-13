@@ -45,6 +45,7 @@ from devos.context.distiller import (  # noqa: E402
     MemoryDistiller,
     DistilledSummary,
     DistillationBudgetError,
+    load_summary,
 )
 
 __all__ = [
@@ -68,4 +69,5 @@ __all__ = [
     "MemoryDistiller",
     "DistilledSummary",
     "DistillationBudgetError",
+    "load_summary",
 ]
