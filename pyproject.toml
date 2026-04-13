@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devos"
+version = "0.1.0"
+description = "A personal software development OS — idea to application using parallel AI agents"
+requires-python = ">=3.10"
+dependencies = [
+    "anthropic>=0.40.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "pydantic>=2.0.0",
+    "gitpython>=3.1.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.scripts]
+devos = "devos.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["devos*"]
