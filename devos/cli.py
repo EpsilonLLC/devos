@@ -190,6 +190,208 @@ def build() -> None:
     )
 
 
+@cli.command()
+@click.option("--task", "task_id", default=None, help="Task ID to run (e.g. T-001).")
+def run(task_id: str | None) -> None:
+    """Run a single task through the full execution pipeline.
+
+    Assembles context, creates an isolated git worktree, launches Claude Code
+    non-interactively, monitors to completion, and distills the output.
+
+    If --task is omitted the first task in Wave 0 is selected (lexicographic).
+    Fails with a clear error if task_graph.json is absent or the spec has
+    changed since the last `devos build`.
+    """
+    import json
+
+    import anthropic
+
+    from devos.agents.claude_code import ClaudeCodeAdapter
+    from devos.context.assembler import ContextAssembler
+    from devos.context.distiller import MemoryDistiller
+    from devos.context.injector import ConstraintInjector, ConstraintsMissingError
+    from devos.decomposition.dependency_graph import Task
+    from devos.execution.monitor import SessionMonitor
+    from devos.execution.reaction import ReactionEngine
+    from devos.execution.spawner import AgentSpawner, SpawnError
+    from devos.execution.worktree import WorktreeManager
+
+    repo_root = Path.cwd()
+    spec_dir = repo_root / "spec"
+    devos_dir = repo_root / ".devos"
+    task_graph_path = devos_dir / "task_graph.json"
+
+    # ── Guard: task_graph.json must exist ────────────────────────────────────
+    if not task_graph_path.exists():
+        console.print(
+            Panel(
+                "[red]No task graph found.[/red]\n"
+                "Run [bold]devos build[/bold] first.",
+                title="[bold red]Run failed[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    graph_data = json.loads(task_graph_path.read_text(encoding="utf-8"))
+
+    # ── Guard: spec hash must match ──────────────────────────────────────────
+    try:
+        current_hash = _compute_spec_hash(spec_dir)
+    except FileNotFoundError:
+        console.print(
+            Panel(
+                "[red]One or more spec files are missing.[/red]\n"
+                "Run [bold]devos build[/bold] to regenerate the task graph.",
+                title="[bold red]Run failed[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    stored_hash = graph_data.get("spec_hash", "")
+    if current_hash != stored_hash:
+        console.print(
+            Panel(
+                "[red]Spec has changed since last build.[/red]\n"
+                "Run [bold]devos build[/bold] again.",
+                title="[bold red]Stale task graph[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    # ── Select task ──────────────────────────────────────────────────────────
+    all_tasks_by_id: dict[str, dict] = {
+        t["id"]: t
+        for wave in graph_data["waves"]
+        for t in wave["tasks"]
+    }
+
+    if task_id:
+        if task_id not in all_tasks_by_id:
+            console.print(
+                Panel(
+                    f"[red]Task {task_id!r} not found in task_graph.json.[/red]",
+                    title="[bold red]Run failed[/bold red]",
+                    border_style="red",
+                )
+            )
+            sys.exit(1)
+        task_dict = all_tasks_by_id[task_id]
+    else:
+        # Pick first task in Wave 0, lexicographic by task ID
+        wave_0 = next(
+            (w for w in graph_data["waves"] if w["wave"] == 0), None
+        )
+        if not wave_0 or not wave_0["tasks"]:
+            console.print(
+                Panel(
+                    "[red]No Wave 0 tasks found in task_graph.json.[/red]",
+                    title="[bold red]Run failed[/bold red]",
+                    border_style="red",
+                )
+            )
+            sys.exit(1)
+        task_dict = min(wave_0["tasks"], key=lambda t: t["id"])
+
+    task = Task(**task_dict)
+
+    # ── Resolve prior summaries from dependencies ────────────────────────────
+    prior_summaries: list[Path] = []
+    for dep_id in task.depends_on:
+        summary_path = devos_dir / "summaries" / f"{dep_id}.md"
+        if summary_path.exists():
+            prior_summaries.append(summary_path)
+        else:
+            console.print(
+                f"[yellow]Warning:[/yellow] summary for dependency {dep_id} "
+                f"not found at {summary_path} — proceeding without it."
+            )
+
+    # ── Wire the execution layer ─────────────────────────────────────────────
+    try:
+        injector = ConstraintInjector(devos_dir / "constraints.md")
+    except ConstraintsMissingError as exc:
+        console.print(
+            Panel(
+                f"[red]{exc}[/red]\n"
+                "Ensure [bold].devos/constraints.md[/bold] exists and is non-empty.",
+                title="[bold red]Run failed[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    assembler = ContextAssembler(repo_root, spec_dir, devos_dir, injector)
+    adapter = ClaudeCodeAdapter()
+    worktree_manager = WorktreeManager(repo_root)
+    spawner = AgentSpawner(repo_root, devos_dir, assembler, worktree_manager, adapter)
+    anthropic_client = anthropic.Anthropic()
+    distiller = MemoryDistiller(anthropic_client)
+    monitor = SessionMonitor(devos_dir, adapter)
+    reaction = ReactionEngine(devos_dir, distiller, worktree_manager, spawner, monitor)
+
+    # ── Run ──────────────────────────────────────────────────────────────────
+    console.print(
+        Panel(
+            f"[bold cyan]DevOS Run[/bold cyan] — {task.id}: {task.name}\n"
+            f"[dim]Agent:[/dim] ClaudeCodeAdapter  "
+            f"[dim]Prior summaries:[/dim] {len(prior_summaries)}",
+            border_style="cyan",
+        )
+    )
+
+    try:
+        with console.status(f"[cyan]Spawning agent for {task.id}...[/cyan]"):
+            session = spawner.spawn(task, prior_summaries)
+    except SpawnError as exc:
+        console.print(
+            Panel(
+                f"[red]{exc}[/red]",
+                title="[bold red]Spawn failed[/bold red]",
+                border_style="red",
+            )
+        )
+        sys.exit(1)
+
+    console.print(
+        f"[green]✓[/green] Agent spawned — session [bold]{session.session_id}[/bold]"
+    )
+
+    session = monitor.watch(session)
+
+    # ── React ────────────────────────────────────────────────────────────────
+    if session.status == "complete":
+        try:
+            summary = reaction.on_complete(session, task)
+        except Exception as exc:
+            console.print(
+                Panel(
+                    f"[red]{exc}[/red]",
+                    title="[bold red]Post-completion reaction failed[/bold red]",
+                    border_style="red",
+                )
+            )
+            sys.exit(1)
+        console.print(
+            Panel(
+                f"[bold green]{task.id} complete.[/bold green]\n\n"
+                f"[dim]Summary:[/dim]\n{summary.rendered_markdown}",
+                title=f"[bold green]Done — {task.name}[/bold green]",
+                border_style="green",
+            )
+        )
+
+    elif session.status == "stalled":
+        reaction.on_stall(session, task)
+        sys.exit(2)
+
+    elif session.status == "failed":
+        reaction.on_failure(session, task)
+        sys.exit(1)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
