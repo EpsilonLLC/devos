@@ -17,6 +17,110 @@ load_dotenv(encoding="utf-8-sig")
 _agent_console = Console(highlight=False, force_terminal=True, legacy_windows=False)
 
 # ---------------------------------------------------------------------------
+# Phase 4 prompts
+# ---------------------------------------------------------------------------
+
+_PHASE4_COMPONENTS_SYSTEM = """\
+You are a product specification agent in Phase 4: Architecture — Component Derivation.
+
+Input: 00_product.md, 01_functional.md, and the user's tech stack and constraint answers (all provided below).
+Your job: derive the module architecture.
+
+Rules:
+- One module per domain area (e.g., auth, tasks, projects, notifications, core)
+- Every module MUST list the F-00X feature IDs it owns (from 01_functional.md)
+- Every module must declare may_import and must_never_import to prevent circular dependencies
+- internal_structure must be a realistic directory listing with inline comments
+- interfaces_exposed: ONLY the public API of the module — specific class or function names other modules import
+- must_not: a concrete violation that would break the architecture
+- Also parse and return the tech stack from the user's stack answer
+- If the user's stack answer is empty or vague, default to:
+  backend="FastAPI + SQLAlchemy async", database="PostgreSQL", frontend=null, queue=null, extras=[]
+
+Output: A JSON object wrapped in <COMPONENTS_JSON>...</COMPONENTS_JSON> tags:
+{
+  "stack": {
+    "backend": "FastAPI + SQLAlchemy async",
+    "frontend": null,
+    "database": "PostgreSQL",
+    "queue": null,
+    "extras": []
+  },
+  "components": [
+    {
+      "name": "auth",
+      "responsibility": "One sentence describing the module's domain.",
+      "owns": "User identity, authentication tokens, sessions",
+      "must_not": "Access task or project tables directly",
+      "features": ["F-001"],
+      "internal_structure": [
+        "auth/",
+        "  routes.py        # FastAPI router",
+        "  service.py       # AuthService class",
+        "  repository.py    # DB queries only",
+        "  schemas.py       # Pydantic request/response models"
+      ],
+      "interfaces_exposed": [
+        "AuthService",
+        "get_current_user"
+      ],
+      "may_import": ["db/", "core/config", "core/exceptions"],
+      "must_never_import": ["tasks/", "projects/", "notifications/"]
+    }
+  ]
+}
+
+Then output the marker: <<<PHASE_4_COMPONENTS_DERIVED>>>
+"""
+
+_PHASE4_CONSTRAINTS_SYSTEM = """\
+You are a product specification agent in Phase 4: Architecture — Constraints Derivation.
+
+Input: 00_product.md, 01_functional.md, the derived component architecture, and the user's answers (all provided below).
+Your job: write the content for .devos/constraints.md.
+
+CRITICAL: constraints.md is injected at position 0 in EVERY future agent context window.
+It MUST be SHORT and declarative. Max 5 items per section. Every line must be a specific, actionable rule.
+Do NOT write descriptions, justifications, or comments — only the rules themselves.
+
+Derive everything from the spec and stack. Do not invent constraints not supported by the input.
+
+Rules to follow:
+- hard_rules: constraints that fail code validation if violated (include tenant scoping, error envelope, no raw SQL outside repositories, etc.)
+- naming: file/class/function/constant conventions
+- always_used: architectural patterns that every module must apply
+- non_functional: performance, security, or reliability requirements derived from the spec (only include if explicitly implied)
+
+Output: A JSON object wrapped in <CONSTRAINTS_JSON>...</CONSTRAINTS_JSON> tags:
+{
+  "hard_rules": [
+    "All DB queries include tenant_id filter",
+    "No raw SQL outside {module}/repository.py",
+    "All endpoints return standard error envelope {error, code, detail}",
+    "No secrets in code — environment variables only",
+    "All async functions use async def"
+  ],
+  "naming": [
+    "Files: snake_case",
+    "Classes: PascalCase",
+    "Functions/variables: snake_case",
+    "Constants: UPPER_SNAKE_CASE"
+  ],
+  "always_used": [
+    "Repository pattern: all DB access through repository classes",
+    "Service layer: business logic in service classes, never in routes",
+    "Pydantic v2 for all request/response models",
+    "Explicit error handling — no bare except:"
+  ],
+  "non_functional": [
+    "All endpoints require authentication unless explicitly marked public"
+  ]
+}
+
+Then output the marker: <<<PHASE_4_CONSTRAINTS_DERIVED>>>
+"""
+
+# ---------------------------------------------------------------------------
 # Phase 3 prompts
 # ---------------------------------------------------------------------------
 
@@ -465,6 +569,137 @@ class PlanningAgent:
 
         return self._parse_api_contract(response_text)
 
+    def ask_architecture_questions(self, questions: list[str]) -> list[str]:
+        """
+        Present exactly 2 architecture questions to the user via Rich CLI.
+        No LLM call. Returns list of answer strings in the same order.
+
+        questions — exactly 2 items: [stack_question, constraints_question]
+        """
+        _agent_console.print(
+            Panel(
+                "[bold]Two quick questions before we derive the architecture.[/bold]\n"
+                "[dim](Press Enter to accept the default shown.)[/dim]",
+                title="[bold cyan]Architecture Questions[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+
+        defaults = [
+            "FastAPI + SQLAlchemy async / PostgreSQL / no queue / no frontend",
+            "No additional hard constraints.",
+        ]
+
+        answers: list[str] = []
+        for i, question in enumerate(questions, 1):
+            _agent_console.print(f"\n[bold][{i}/{len(questions)}][/bold] {question}")
+            try:
+                answer = Prompt.ask("  Your answer")
+            except EOFError:
+                answer = ""
+            answer = answer.strip() or defaults[i - 1]
+            answers.append(answer)
+
+        return answers
+
+    def derive_components(
+        self,
+        product_spec: str,
+        functional_spec: str,
+        stack_answer: str = "",
+        constraints_answer: str = "",
+    ) -> tuple[list, "TechStack | None"]:
+        """
+        Phase 4 — Component architecture derivation.
+
+        Reads 00_product.md + 01_functional.md content (fresh context — no Phase 3 memory).
+        Also receives the user's stack and constraint answers to inform module design.
+
+        Returns (components, stack) where:
+          components — list of Component Pydantic objects
+          stack      — TechStack parsed from the user's stack answer (or None on failure)
+        """
+        from devos.planning.spec_generator import Component, TechStack
+
+        user_content = (
+            "Here is 00_product.md:\n\n"
+            f"{product_spec}\n\n"
+            "Here is 01_functional.md:\n\n"
+            f"{functional_spec}\n\n"
+            f"User's tech stack answer: {stack_answer or 'Use sensible defaults.'}\n\n"
+            f"User's hard constraints answer: {constraints_answer or 'None specified.'}\n\n"
+            "Derive the complete module architecture. Every module must list the F-00X "
+            "feature IDs it owns. Parse the tech stack from the user's answer."
+        )
+
+        message = self._client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=8192,
+            system=_PHASE4_COMPONENTS_SYSTEM,
+            messages=[{"role": "user", "content": user_content}],
+        )
+
+        response_text = message.content[0].text
+
+        if "<<<PHASE_4_COMPONENTS_DERIVED>>>" not in response_text:
+            raise ValueError(
+                "Phase 4 components marker <<<PHASE_4_COMPONENTS_DERIVED>>> not found.\n"
+                f"Response was:\n{response_text}"
+            )
+
+        return self._parse_components(response_text)
+
+    def derive_constraints(
+        self,
+        product_spec: str,
+        functional_spec: str,
+        components: list,
+        stack_answer: str = "",
+        constraints_answer: str = "",
+    ) -> "ArchConstraints":
+        """
+        Phase 4 — Constraints derivation.
+
+        Fresh LLM context. Reads spec files + confirmed component list.
+        Returns an ArchConstraints Pydantic object for .devos/constraints.md.
+        """
+        from devos.planning.spec_generator import ArchConstraints, Component
+
+        components_summary = "\n".join(
+            f"- {c.name}/: owns {c.owns} (features: {', '.join(c.features)})"
+            for c in components
+            if isinstance(c, Component)
+        )
+
+        user_content = (
+            "Here is 00_product.md:\n\n"
+            f"{product_spec}\n\n"
+            "Here is 01_functional.md:\n\n"
+            f"{functional_spec}\n\n"
+            "Here are the confirmed modules:\n\n"
+            f"{components_summary}\n\n"
+            f"Tech stack: {stack_answer or 'FastAPI + SQLAlchemy async / PostgreSQL'}\n\n"
+            f"User's hard constraints: {constraints_answer or 'None specified.'}\n\n"
+            "Derive the constraints file content. Keep it SHORT — max 5 items per section."
+        )
+
+        message = self._client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=2048,
+            system=_PHASE4_CONSTRAINTS_SYSTEM,
+            messages=[{"role": "user", "content": user_content}],
+        )
+
+        response_text = message.content[0].text
+
+        if "<<<PHASE_4_CONSTRAINTS_DERIVED>>>" not in response_text:
+            raise ValueError(
+                "Phase 4 constraints marker <<<PHASE_4_CONSTRAINTS_DERIVED>>> not found.\n"
+                f"Response was:\n{response_text}"
+            )
+
+        return self._parse_arch_constraints(response_text)
+
     def ask_schema_questions(self, questions: list[str]) -> list[str]:
         """
         Present gap questions to the user via Rich CLI and return their answers.
@@ -689,3 +924,82 @@ class PlanningAgent:
             endpoints.append(Endpoint(**ep))
 
         return endpoints
+
+    def _parse_components(self, text: str) -> tuple[list, "TechStack | None"]:
+        """Extract COMPONENTS_JSON from the LLM response."""
+        from devos.planning.spec_generator import Component, TechStack
+
+        match = re.search(
+            r"<COMPONENTS_JSON>(.*?)</COMPONENTS_JSON>",
+            text,
+            re.DOTALL,
+        )
+        if not match:
+            raise ValueError(
+                "Could not find <COMPONENTS_JSON>...</COMPONENTS_JSON> in LLM response.\n"
+                f"Response was:\n{text}"
+            )
+
+        raw_json = match.group(1).strip()
+        try:
+            data = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Failed to parse COMPONENTS_JSON: {exc}\nRaw JSON:\n{raw_json}"
+            ) from exc
+
+        if "components" not in data:
+            raise ValueError("COMPONENTS_JSON missing required key: 'components'")
+
+        components: list[Component] = []
+        for c in data["components"]:
+            c.setdefault("internal_structure", [])
+            c.setdefault("interfaces_exposed", [])
+            c.setdefault("may_import", [])
+            c.setdefault("must_never_import", [])
+            c.setdefault("features", [])
+            components.append(Component(**c))
+
+        stack: TechStack | None = None
+        if "stack" in data and isinstance(data["stack"], dict):
+            try:
+                sd = data["stack"]
+                sd.setdefault("extras", [])
+                sd.setdefault("frontend", None)
+                sd.setdefault("queue", None)
+                stack = TechStack(**sd)
+            except Exception:
+                stack = None
+
+        return components, stack
+
+    def _parse_arch_constraints(self, text: str) -> "ArchConstraints":
+        """Extract CONSTRAINTS_JSON from the LLM response."""
+        from devos.planning.spec_generator import ArchConstraints
+
+        match = re.search(
+            r"<CONSTRAINTS_JSON>(.*?)</CONSTRAINTS_JSON>",
+            text,
+            re.DOTALL,
+        )
+        if not match:
+            raise ValueError(
+                "Could not find <CONSTRAINTS_JSON>...</CONSTRAINTS_JSON> in LLM response.\n"
+                f"Response was:\n{text}"
+            )
+
+        raw_json = match.group(1).strip()
+        try:
+            data = json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"Failed to parse CONSTRAINTS_JSON: {exc}\nRaw JSON:\n{raw_json}"
+            ) from exc
+
+        required = {"hard_rules", "naming", "always_used"}
+        missing = required - data.keys()
+        if missing:
+            raise ValueError(f"CONSTRAINTS_JSON missing required keys: {missing}")
+
+        data.setdefault("non_functional", [])
+        return ArchConstraints(**data)

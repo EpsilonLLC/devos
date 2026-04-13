@@ -56,6 +56,25 @@ class TechStack(BaseModel):
     extras: list[str]
 
 
+class Component(BaseModel):
+    name: str                       # module directory name, e.g. "auth"
+    responsibility: str             # one sentence
+    owns: str                       # domain owned (for ownership table)
+    must_not: str                   # violation to avoid (for ownership table)
+    features: list[str]            # F-00X IDs this module owns
+    internal_structure: list[str]  # directory tree lines
+    interfaces_exposed: list[str]  # what other modules may import
+    may_import: list[str]
+    must_never_import: list[str]
+
+
+class ArchConstraints(BaseModel):
+    hard_rules: list[str]
+    naming: list[str]
+    always_used: list[str]
+    non_functional: list[str] = []
+
+
 @dataclass
 class InterviewState:
     idea: str
@@ -71,6 +90,8 @@ class InterviewState:
     endpoints: list[Endpoint] = field(default_factory=list)
     stack: Optional[TechStack] = None
     constraints: list[str] = field(default_factory=list)
+    components: list[Component] = field(default_factory=list)
+    arch_constraints: Optional[ArchConstraints] = None
     current_phase: int = 0
 
 
@@ -80,6 +101,26 @@ class InterviewState:
 
 class SpecGenerator:
     """Writes structured spec files from an InterviewState."""
+
+    def write_components(self, state: InterviewState, output_dir: Path) -> Path:
+        """Write spec/04_components.md and return its path."""
+        spec_dir = output_dir / "spec"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        path = spec_dir / "04_components.md"
+        path.write_text(self._render_components(state), encoding="utf-8")
+        return path
+
+    def write_constraints(self, state: InterviewState, output_dir: Path) -> Path:
+        """Write .devos/constraints.md and return its path.
+
+        This file is injected at position 0 in every future agent context window.
+        It must stay short (max 20 lines of constraint content) and declarative.
+        """
+        devos_dir = output_dir / ".devos"
+        devos_dir.mkdir(parents=True, exist_ok=True)
+        path = devos_dir / "constraints.md"
+        path.write_text(self._render_constraints(state), encoding="utf-8")
+        return path
 
     def write_data_model(self, state: InterviewState, output_dir: Path) -> Path:
         """Write spec/02_data_model.md and return its path."""
@@ -288,6 +329,128 @@ class SpecGenerator:
                 lines.append("")
 
             lines.append("---")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _render_components(self, state: InterviewState) -> str:
+        lines: list[str] = ["# Component architecture", ""]
+
+        # Module ownership table
+        lines += [
+            "## Module ownership (locked — no cross-module direct access)",
+            "| Module | Owns | Must not |",
+            "|--------|------|----------|",
+        ]
+        for comp in state.components:
+            lines.append(f"| `{comp.name}/` | {comp.owns} | {comp.must_not} |")
+        lines.append("")
+
+        # Patterns section — derived from arch_constraints.always_used
+        lines += ["## Patterns (guided)"]
+        if state.arch_constraints and state.arch_constraints.always_used:
+            for pattern in state.arch_constraints.always_used:
+                lines.append(f"- {pattern}")
+        else:
+            lines += [
+                "- Repository pattern: All DB access through repository classes",
+                "- Service layer: Business logic in service classes, never in routes",
+                "- Dependency injection: Constructor args, no global state",
+            ]
+        lines.append("")
+
+        # Per-module sections
+        for comp in state.components:
+            lines.append("---")
+            lines.append(f"### Module: `{comp.name}/`")
+            lines.append(f"**Responsibility:** {comp.responsibility}")
+            lines.append("")
+
+            if comp.features:
+                lines.append(f"**Features owned:** {', '.join(comp.features)}")
+                lines.append("")
+
+            lines.append("**Internal structure (guided):**")
+            lines.append("```")
+            for line in comp.internal_structure:
+                lines.append(line)
+            lines.append("```")
+            lines.append("")
+
+            lines.append("**Interfaces exposed:**")
+            if comp.interfaces_exposed:
+                for iface in comp.interfaces_exposed:
+                    lines.append(f"- `{iface}`")
+            else:
+                lines.append("- _(none — internal module only)_")
+            lines.append("")
+
+            lines.append("**May import:**")
+            if comp.may_import:
+                for imp in comp.may_import:
+                    lines.append(f"- `{imp}`")
+            else:
+                lines.append("- _(none)_")
+            lines.append("")
+
+            lines.append("**Must never import:**")
+            if comp.must_never_import:
+                for imp in comp.must_never_import:
+                    lines.append(f"- `{imp}`")
+            else:
+                lines.append("- _(no restrictions beyond ownership table)_")
+            lines += ["---", ""]
+
+        return "\n".join(lines)
+
+    def _render_constraints(self, state: InterviewState) -> str:
+        lines: list[str] = [
+            "# Constraints",
+            "# Injected at TOP of every agent context. Never summarized away.",
+            "",
+        ]
+
+        # Stack section
+        if state.stack:
+            lines += ["## Stack"]
+            lines.append(f"- Backend: {state.stack.backend}")
+            lines.append(f"- Database: {state.stack.database}")
+            if state.stack.frontend:
+                lines.append(f"- Frontend: {state.stack.frontend}")
+            if state.stack.queue:
+                lines.append(f"- Queue: {state.stack.queue}")
+            for extra in state.stack.extras:
+                lines.append(f"- {extra}")
+            lines.append("")
+
+        ac = state.arch_constraints
+
+        # Hard rules
+        lines += ["## Hard rules — violation fails validation"]
+        if ac and ac.hard_rules:
+            for rule in ac.hard_rules:
+                lines.append(f"- {rule}")
+        lines.append("")
+
+        # Naming
+        lines += ["## Naming"]
+        if ac and ac.naming:
+            for rule in ac.naming:
+                lines.append(f"- {rule}")
+        lines.append("")
+
+        # Always used
+        lines += ["## Always used"]
+        if ac and ac.always_used:
+            for rule in ac.always_used:
+                lines.append(f"- {rule}")
+        lines.append("")
+
+        # Non-functional (only if present — keeps file short)
+        if ac and ac.non_functional:
+            lines += ["## Non-functional"]
+            for rule in ac.non_functional:
+                lines.append(f"- {rule}")
             lines.append("")
 
         return "\n".join(lines)

@@ -46,6 +46,8 @@ def _persist_state(state: InterviewState, devos_dir: Path) -> None:
         "tables": [t.model_dump() for t in state.tables],
         "endpoints": [e.model_dump() for e in state.endpoints],
         "stack": state.stack.model_dump() if state.stack else None,
+        "components": [c.model_dump() for c in state.components],
+        "arch_constraints": state.arch_constraints.model_dump() if state.arch_constraints else None,
     }
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -696,15 +698,232 @@ class Phase3_DataAPI:
 
 
 class Phase4_Architecture:
+    """Derive module architecture and constraints; write spec/04_components.md and .devos/constraints.md."""
+
     name = "phase-4-architecture"
 
     def __init__(self, state: InterviewState) -> None:
         self._state = state
+        self._devos_dir = Path.cwd() / ".devos"
+        self._agent = PlanningAgent()
+        self._gen = SpecGenerator()
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
     def run(self) -> InterviewState:
-        console.print("[dim]Phase 4 (Architecture) — not yet implemented[/dim]")
+        console.print(
+            Panel(
+                "[bold cyan]Phase 4 — Architecture[/bold cyan]\n"
+                "We'll define module boundaries and write the constraints file.",
+                title="[bold]DevOS[/bold]",
+                border_style="cyan",
+            )
+        )
+
+        # ── Fresh context from disk — never from Phase 3 memory ───────────
+        product_spec_path = Path.cwd() / "spec" / "00_product.md"
+        functional_spec_path = Path.cwd() / "spec" / "01_functional.md"
+
+        if not product_spec_path.exists():
+            raise FileNotFoundError("spec/00_product.md not found. Run Phase 1 first.")
+        if not functional_spec_path.exists():
+            raise FileNotFoundError(
+                "spec/01_functional.md not found. Run Phase 2 first."
+            )
+
+        product_spec = product_spec_path.read_text(encoding="utf-8")
+        functional_spec = functional_spec_path.read_text(encoding="utf-8")
+
+        # ── Step 1: Ask exactly 2 architecture questions ──────────────────
+        questions = [
+            "What tech stack should this use?\n"
+            "      [dim](Default: FastAPI + SQLAlchemy async / PostgreSQL / no queue / no frontend.[/dim]\n"
+            "      [dim]Press Enter to accept the default.)[/dim]",
+            "Any hard constraints to respect?\n"
+            "      [dim](e.g., must use JWT auth, must support multi-tenancy, max 256 MB RAM.)[/dim]\n"
+            "      [dim]Press Enter if none.[/dim]",
+        ]
+        answers = self._agent.ask_architecture_questions(questions)
+        stack_answer = answers[0]
+        constraints_answer = answers[1]
+        _persist_state(self._state, self._devos_dir)
+
+        # ── Step 2: Derive components ──────────────────────────────────────
+        console.print()
+        with Live(
+            Text("  Deriving module architecture from spec...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            components, stack = self._agent.derive_components(
+                product_spec, functional_spec, stack_answer, constraints_answer
+            )
+
+        if stack:
+            self._state.stack = stack
+
+        # ── Step 3: Show module ownership table for confirmation ───────────
+        components = self._confirm_module_list(components)
+        self._state.components = components
+        _persist_state(self._state, self._devos_dir)
+
+        # ── Step 4: Derive constraints ─────────────────────────────────────
+        console.print()
+        with Live(
+            Text("  Deriving constraints...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            arch_constraints = self._agent.derive_constraints(
+                product_spec, functional_spec, components, stack_answer, constraints_answer
+            )
+
+        # ── Step 5: Show constraints summary for confirmation ─────────────
+        arch_constraints = self._confirm_constraints(arch_constraints)
+        self._state.arch_constraints = arch_constraints
+        _persist_state(self._state, self._devos_dir)
+
+        # ── Step 6: Write both files ───────────────────────────────────────
+        output_dir = Path.cwd()
+
+        with Live(
+            Text("  Writing spec/04_components.md...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            comp_path = self._gen.write_components(self._state, output_dir)
+
+        console.print(
+            Panel(
+                f"[green]OK[/green] Written: [bold]{comp_path.relative_to(output_dir)}[/bold]",
+                border_style="green",
+            )
+        )
+
+        with Live(
+            Text("  Writing .devos/constraints.md...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            cst_path = self._gen.write_constraints(self._state, output_dir)
+
+        console.print(
+            Panel(
+                f"[green]OK[/green] Written: [bold]{cst_path.relative_to(output_dir)}[/bold]",
+                border_style="green",
+            )
+        )
+
         self._state.current_phase = 4
+        console.print("\n[bold green]Phase 4 complete.[/bold green]\n")
         return self._state
+
+    # ------------------------------------------------------------------
+    # Module list confirmation
+    # ------------------------------------------------------------------
+
+    def _confirm_module_list(self, components: list) -> list:
+        """Show module ownership table and let user confirm before proceeding."""
+        self._print_module_table(components)
+
+        try:
+            confirmed = Confirm.ask(
+                "\n[bold]Confirm this module list?[/bold]", default=True
+            )
+        except EOFError:
+            return components
+
+        if confirmed:
+            return components
+
+        console.print(
+            Panel(
+                "[yellow]Modules are derived from the feature list in the spec.\n"
+                "To adjust, edit spec/01_functional.md and re-run, or accept and\n"
+                "edit spec/04_components.md directly after it is written.[/yellow]",
+                border_style="yellow",
+            )
+        )
+        return components
+
+    def _print_module_table(self, components: list) -> None:
+        lines = [
+            "  [bold]Module[/bold]        [bold]Features[/bold]   [bold]Owns[/bold]",
+            "  " + "-" * 60,
+        ]
+        for comp in components:
+            features_str = ", ".join(comp.features) if comp.features else "—"
+            lines.append(
+                f"  [bold]{comp.name + '/'}[/bold]".ljust(22)
+                + f"  {features_str}".ljust(14)
+                + f"  [dim]{comp.owns[:50]}[/dim]"
+            )
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold cyan]Derived modules[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Constraints confirmation
+    # ------------------------------------------------------------------
+
+    def _confirm_constraints(self, arch_constraints) -> object:
+        """Show constraints summary and let user confirm."""
+        self._print_constraints_summary(arch_constraints)
+
+        try:
+            confirmed = Confirm.ask(
+                "\n[bold]Confirm these constraints?[/bold]", default=True
+            )
+        except EOFError:
+            return arch_constraints
+
+        if confirmed:
+            return arch_constraints
+
+        console.print(
+            Panel(
+                "[yellow]Constraints are derived from the spec and stack.\n"
+                "Accept and edit .devos/constraints.md directly after it is written.[/yellow]",
+                border_style="yellow",
+            )
+        )
+        return arch_constraints
+
+    def _print_constraints_summary(self, ac) -> None:
+        lines = []
+        lines.append(f"[bold]Hard rules[/bold] ({len(ac.hard_rules)}):")
+        for rule in ac.hard_rules:
+            lines.append(f"  - {rule}")
+        lines.append("")
+        lines.append(f"[bold]Naming[/bold] ({len(ac.naming)}):")
+        for rule in ac.naming:
+            lines.append(f"  - {rule}")
+        lines.append("")
+        lines.append(f"[bold]Always used[/bold] ({len(ac.always_used)}):")
+        for rule in ac.always_used:
+            lines.append(f"  - {rule}")
+        if ac.non_functional:
+            lines.append("")
+            lines.append(f"[bold]Non-functional[/bold] ({len(ac.non_functional)}):")
+            for rule in ac.non_functional:
+                lines.append(f"  - {rule}")
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold cyan]Constraints summary[/bold cyan]",
+                border_style="cyan",
+            )
+        )
 
 
 class Phase5_Acceptance:
@@ -776,9 +995,17 @@ class InterviewStateMachine:
                     ],
                     "spec(phase-3): data model + API contract",
                 )
+            elif phase.name == "phase-4-architecture":
+                self._commit_spec(
+                    [
+                        Path.cwd() / "spec" / "04_components.md",
+                        Path.cwd() / ".devos" / "constraints.md",
+                    ],
+                    "spec(phase-4): architecture + constraints",
+                )
 
-            # Stop once Phase 3 is complete (Phase 4+ not yet implemented)
-            if state.current_phase >= 3:
+            # Stop once Phase 4 is complete (Phase 5 not yet implemented)
+            if state.current_phase >= 4:
                 break
 
         return state
@@ -791,7 +1018,9 @@ class InterviewStateMachine:
         _persist_state(state, self._devos_dir)
 
     def _load_state(self) -> InterviewState | None:
-        from devos.planning.spec_generator import Feature, Table, Endpoint
+        from devos.planning.spec_generator import (
+            Feature, Table, Endpoint, Component, ArchConstraints, TechStack
+        )
 
         path = self._devos_dir / "interview_state.json"
         if not path.exists():
@@ -826,9 +1055,46 @@ class InterviewStateMachine:
                 except Exception:
                     pass
 
+            # Restore components
+            components: list[Component] = []
+            for c_data in data.get("components", []):
+                try:
+                    c_data.setdefault("internal_structure", [])
+                    c_data.setdefault("interfaces_exposed", [])
+                    c_data.setdefault("may_import", [])
+                    c_data.setdefault("must_never_import", [])
+                    c_data.setdefault("features", [])
+                    components.append(Component(**c_data))
+                except Exception:
+                    pass
+
+            # Restore arch_constraints
+            arch_constraints: ArchConstraints | None = None
+            ac_data = data.get("arch_constraints")
+            if ac_data:
+                try:
+                    ac_data.setdefault("non_functional", [])
+                    arch_constraints = ArchConstraints(**ac_data)
+                except Exception:
+                    pass
+
+            # Restore stack
+            stack: TechStack | None = None
+            stack_data = data.get("stack")
+            if stack_data:
+                try:
+                    stack_data.setdefault("extras", [])
+                    stack_data.setdefault("frontend", None)
+                    stack_data.setdefault("queue", None)
+                    stack = TechStack(**stack_data)
+                except Exception:
+                    pass
+
             loaded_phase = data.get("current_phase", 0)
 
-            # Sanity check: phase counter is only valid when output was produced.
+            # Sanity checks: phase counter is only valid when output was produced.
+            if loaded_phase >= 4 and not components:
+                loaded_phase = 3  # Phase 4 was never actually completed
             if loaded_phase >= 3 and not tables:
                 loaded_phase = 2  # Phase 3 was never actually completed
             if loaded_phase >= 2 and not features:
@@ -850,6 +1116,9 @@ class InterviewStateMachine:
                 features=features,
                 tables=tables,
                 endpoints=endpoints,
+                stack=stack,
+                components=components,
+                arch_constraints=arch_constraints,
             )
         except Exception:
             return None
