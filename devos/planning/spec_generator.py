@@ -78,6 +78,15 @@ class InterviewState:
 class SpecGenerator:
     """Writes structured spec files from an InterviewState."""
 
+    def write_functional(self, state: InterviewState, output_dir: Path) -> Path:
+        """Write 01_functional.md and return its path."""
+        spec_dir = output_dir / "spec"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+
+        path = spec_dir / "01_functional.md"
+        path.write_text(self._render_functional(state), encoding="utf-8")
+        return path
+
     def write_product(self, state: InterviewState, output_dir: Path) -> Path:
         """Write 00_product.md and return its path."""
         spec_dir = output_dir / "spec"
@@ -147,5 +156,47 @@ class SpecGenerator:
         else:
             lines.append("- _Not yet defined_")
         lines.append("")
+
+        return "\n".join(lines)
+
+    def _render_functional(self, state: InterviewState) -> str:
+        import re
+
+        lines: list[str] = [
+            "# Functional specification",
+            "",
+            "## Feature schema",
+            "Every feature uses this exact structure.",
+            "",
+        ]
+
+        for feature in state.features:
+            lines += [
+                "---",
+                f"### {feature.id}: {feature.name}",
+                f"**Status:** {feature.status}",
+                "**Zone:** locked",
+                "",
+                f"**Trigger:** {feature.trigger}",
+                "",
+                "**Preconditions:**",
+            ]
+            for pre in feature.preconditions:
+                lines.append(f"- {pre}")
+            lines.append("")
+            lines.append("**Behavior:**")
+            for i, step in enumerate(feature.behavior, 1):
+                # Normalise numbering: strip any existing "N." prefix then re-add
+                clean = re.sub(r"^\d+\.\s*", "", step).strip()
+                lines.append(f"{i}. {clean}")
+            lines.append("")
+            lines.append("**Edge cases:**")
+            for ec in feature.edge_cases:
+                lines.append(f"- {ec}")
+            lines.append("")
+            lines.append("**Out of scope for this feature:**")
+            for oos in feature.out_of_scope:
+                lines.append(f"- {oos}")
+            lines += ["---", ""]
 
         return "\n".join(lines)
