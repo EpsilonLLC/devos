@@ -32,17 +32,20 @@ class Table(BaseModel):
     indexes: list[str]
     relationships: list[str]
     invariants: list[str]
+    out_of_scope: list[str] = []
 
 
 class Endpoint(BaseModel):
     method: str                   # GET POST PATCH DELETE
     path: str                     # /api/v1/...
     auth_required: bool
+    purpose: str = ""
     request_body: Optional[dict]
     response_200: dict
     error_responses: list[dict]   # scenario, http_code, code
     side_effects: list[str]
     feature_id: str               # F-001 etc — cross reference
+    out_of_scope: list[str] = []
 
 
 class TechStack(BaseModel):
@@ -77,6 +80,22 @@ class InterviewState:
 
 class SpecGenerator:
     """Writes structured spec files from an InterviewState."""
+
+    def write_data_model(self, state: InterviewState, output_dir: Path) -> Path:
+        """Write spec/02_data_model.md and return its path."""
+        spec_dir = output_dir / "spec"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        path = spec_dir / "02_data_model.md"
+        path.write_text(self._render_data_model(state), encoding="utf-8")
+        return path
+
+    def write_api_contract(self, state: InterviewState, output_dir: Path) -> Path:
+        """Write spec/03_api_contract.md and return its path."""
+        spec_dir = output_dir / "spec"
+        spec_dir.mkdir(parents=True, exist_ok=True)
+        path = spec_dir / "03_api_contract.md"
+        path.write_text(self._render_api_contract(state), encoding="utf-8")
+        return path
 
     def write_functional(self, state: InterviewState, output_dir: Path) -> Path:
         """Write 01_functional.md and return its path."""
@@ -198,5 +217,169 @@ class SpecGenerator:
             for oos in feature.out_of_scope:
                 lines.append(f"- {oos}")
             lines += ["---", ""]
+
+        return "\n".join(lines)
+
+    def _render_data_model(self, state: InterviewState) -> str:
+        import json
+
+        lines: list[str] = [
+            "# Data model",
+            "",
+            "## Conventions (locked — agents must follow exactly)",
+            "- All tables: snake_case",
+            "- All PKs: `id UUID DEFAULT gen_random_uuid()`",
+            "- All tables: `created_at TIMESTAMPTZ DEFAULT NOW()`",
+            "- All tables: `updated_at TIMESTAMPTZ DEFAULT NOW()`",
+            "- Soft deletes: `deleted_at TIMESTAMPTZ NULL`",
+            "- Tenant scoping: every table except `tenants` has `tenant_id UUID NOT NULL`",
+            "",
+            "## Tables",
+            "",
+        ]
+
+        for table in state.tables:
+            lines.append("---")
+            lines.append(f"### `{table.name}`")
+            lines.append(f"**Purpose:** {table.purpose}")
+            lines.append("")
+
+            lines.append("| Column | Type | Nullable | Default | Constraint |")
+            lines.append("|--------|------|----------|---------|------------|")
+            for col in table.columns:
+                name = col.get("name", "")
+                col_type = col.get("type", "")
+                nullable = "YES" if col.get("nullable", True) else "NO"
+                default = col.get("default") or ""
+                constraint = col.get("constraint") or ""
+                lines.append(
+                    f"| {name} | {col_type} | {nullable} | {default} | {constraint} |"
+                )
+            lines.append("")
+
+            lines.append("**Indexes:**")
+            if table.indexes:
+                for idx in table.indexes:
+                    lines.append(f"- {idx}")
+            else:
+                lines.append("- None beyond primary key")
+            lines.append("")
+
+            lines.append("**Relationships:**")
+            if table.relationships:
+                for rel in table.relationships:
+                    lines.append(f"- {rel}")
+            else:
+                lines.append("- None")
+            lines.append("")
+
+            lines.append("**Invariants:**")
+            if table.invariants:
+                for inv in table.invariants:
+                    lines.append(f"- {inv}")
+            else:
+                lines.append("- None")
+            lines.append("")
+
+            if table.out_of_scope:
+                lines.append("**Out of scope:**")
+                for oos in table.out_of_scope:
+                    lines.append(f"- {oos}")
+                lines.append("")
+
+            lines.append("---")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _render_api_contract(self, state: InterviewState) -> str:
+        import json
+
+        lines: list[str] = [
+            "# API contract",
+            "",
+            "## Conventions (locked)",
+            "- Base path: `/api/v1`",
+            "- Auth: Bearer token in Authorization header (all unless marked [public])",
+            "- All requests: Content-Type: application/json",
+            "- Timestamps: ISO 8601 UTC",
+            "- IDs: UUID strings",
+            "",
+            "## Error envelope (locked — every error response)",
+            "```json",
+            "{",
+            '  "error": "human_readable_message",',
+            '  "code": "MACHINE_READABLE_CODE",',
+            '  "detail": {}',
+            "}",
+            "```",
+            "",
+            "## Standard error codes",
+            "| HTTP | Code | Meaning |",
+            "|------|------|---------|",
+            "| 400 | VALIDATION_ERROR | Request body invalid |",
+            "| 401 | UNAUTHORIZED | Missing or invalid token |",
+            "| 403 | FORBIDDEN | Insufficient permission |",
+            "| 404 | NOT_FOUND | Resource does not exist |",
+            "| 409 | CONFLICT | State conflict |",
+            "| 422 | UNPROCESSABLE | Valid syntax, invalid semantics |",
+            "| 429 | RATE_LIMITED | Too many requests |",
+            "| 500 | INTERNAL_ERROR | Server fault |",
+            "",
+        ]
+
+        for ep in state.endpoints:
+            auth_note = "" if ep.auth_required else " [public]"
+            lines.append("---")
+            lines.append(f"### `{ep.method} {ep.path}`{auth_note}")
+            if ep.purpose:
+                lines.append(f"**Purpose:** {ep.purpose}")
+            lines.append(f"**Feature:** {ep.feature_id}")
+            lines.append("")
+
+            if ep.request_body:
+                lines.append("**Request body:**")
+                lines.append("```json")
+                lines.append(json.dumps(ep.request_body, indent=2))
+                lines.append("```")
+            else:
+                lines.append("**Request body:** None")
+            lines.append("")
+
+            lines.append("**Response 200:**")
+            lines.append("```json")
+            lines.append(json.dumps(ep.response_200, indent=2))
+            lines.append("```")
+            lines.append("")
+
+            lines.append("**Response errors:**")
+            if ep.error_responses:
+                lines.append("| Scenario | HTTP | Code |")
+                lines.append("|----------|------|------|")
+                for err in ep.error_responses:
+                    scenario = err.get("scenario", "")
+                    http_code = err.get("http_code", "")
+                    code = err.get("code", "")
+                    lines.append(f"| {scenario} | {http_code} | {code} |")
+            else:
+                lines.append("| None beyond standard codes | — | — |")
+            lines.append("")
+
+            lines.append("**Side effects:**")
+            if ep.side_effects:
+                for se in ep.side_effects:
+                    lines.append(f"- {se}")
+            else:
+                lines.append("- None")
+            lines.append("")
+
+            if ep.out_of_scope:
+                lines.append("**Out of scope:**")
+                for oos in ep.out_of_scope:
+                    lines.append(f"- {oos}")
+                lines.append("")
+
+            lines.append("---")
+            lines.append("")
 
         return "\n".join(lines)

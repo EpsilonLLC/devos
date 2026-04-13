@@ -16,7 +16,7 @@ from rich.text import Text
 from devos.planning.spec_generator import InterviewState, SpecGenerator
 from devos.planning.planning_agent import PlanningAgent
 
-console = Console(highlight=False)
+console = Console(highlight=False, force_terminal=True, legacy_windows=False)
 
 _MIN_IDEA_LEN = 10
 _MAX_IDEA_LEN = 500
@@ -492,15 +492,207 @@ class Phase2_Features:
 
 
 class Phase3_DataAPI:
+    """Derive data model + API contract; write spec/02_data_model.md and spec/03_api_contract.md."""
+
     name = "phase-3-data-api"
 
     def __init__(self, state: InterviewState) -> None:
         self._state = state
+        self._devos_dir = Path.cwd() / ".devos"
+        self._agent = PlanningAgent()
+        self._gen = SpecGenerator()
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
 
     def run(self) -> InterviewState:
-        console.print("[dim]Phase 3 (Data + API) — not yet implemented[/dim]")
+        console.print(
+            Panel(
+                "[bold cyan]Phase 3 — Data + API[/bold cyan]\n"
+                "We'll derive the data model and API contract from the spec.",
+                title="[bold]DevOS[/bold]",
+                border_style="cyan",
+            )
+        )
+
+        # ── Fresh context from disk — never from Phase 2 memory ───────────
+        product_spec_path = Path.cwd() / "spec" / "00_product.md"
+        functional_spec_path = Path.cwd() / "spec" / "01_functional.md"
+
+        if not product_spec_path.exists():
+            raise FileNotFoundError("spec/00_product.md not found. Run Phase 1 first.")
+        if not functional_spec_path.exists():
+            raise FileNotFoundError(
+                "spec/01_functional.md not found. Run Phase 2 first."
+            )
+
+        product_spec = product_spec_path.read_text(encoding="utf-8")
+        functional_spec = functional_spec_path.read_text(encoding="utf-8")
+
+        # ── Step 1: Derive tables + gap questions ──────────────────────────
+        console.print()
+        with Live(
+            Text("  Deriving data model from spec...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            tables, gap_questions = self._agent.derive_data_model(
+                product_spec, functional_spec
+            )
+
+        # ── Step 2: Ask 0–4 gap questions (only what can't be derived) ─────
+        if gap_questions:
+            answers = self._agent.ask_schema_questions(gap_questions)
+            # Annotate state for audit trail (answers stored on state.constraints)
+            for q, a in zip(gap_questions, answers):
+                self._state.constraints.append(f"Schema decision — Q: {q} A: {a}")
+            _persist_state(self._state, self._devos_dir)
+
+        # ── Step 3: Show table list for confirmation ───────────────────────
+        tables = self._confirm_table_list(tables)
+        self._state.tables = tables
+        _persist_state(self._state, self._devos_dir)
+
+        # ── Step 4: Derive API contract from confirmed tables ──────────────
+        console.print()
+        with Live(
+            Text("  Deriving API contract from spec + tables...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            endpoints = self._agent.derive_api_contract(
+                product_spec, functional_spec, tables
+            )
+
+        # ── Step 5: Show endpoint list for confirmation ────────────────────
+        endpoints = self._confirm_endpoint_list(endpoints)
+        self._state.endpoints = endpoints
+        _persist_state(self._state, self._devos_dir)
+
+        # ── Step 6: Write both spec files ──────────────────────────────────
+        output_dir = Path.cwd()
+
+        with Live(
+            Text("  Writing spec/02_data_model.md...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            dm_path = self._gen.write_data_model(self._state, output_dir)
+
+        console.print(
+            Panel(
+                f"[green]OK[/green] Written: [bold]{dm_path.relative_to(output_dir)}[/bold]",
+                border_style="green",
+            )
+        )
+
+        with Live(
+            Text("  Writing spec/03_api_contract.md...", style="dim"),
+            console=console,
+            refresh_per_second=10,
+            transient=True,
+        ):
+            api_path = self._gen.write_api_contract(self._state, output_dir)
+
+        console.print(
+            Panel(
+                f"[green]OK[/green] Written: [bold]{api_path.relative_to(output_dir)}[/bold]",
+                border_style="green",
+            )
+        )
+
         self._state.current_phase = 3
+        console.print("\n[bold green]Phase 3 complete.[/bold green]\n")
         return self._state
+
+    # ------------------------------------------------------------------
+    # Table list confirmation
+    # ------------------------------------------------------------------
+
+    def _confirm_table_list(self, tables: list) -> list:
+        """Show table names and let user confirm before proceeding."""
+        self._print_table_list(tables)
+
+        try:
+            confirmed = Confirm.ask(
+                "\n[bold]Confirm this table list?[/bold]", default=True
+            )
+        except EOFError:
+            return tables
+
+        if confirmed:
+            return tables
+
+        console.print(
+            Panel(
+                "[yellow]Tables are derived from the spec. To adjust the schema,\n"
+                "edit spec/01_functional.md and re-run Phase 3, or accept and\n"
+                "edit spec/02_data_model.md directly after it is written.[/yellow]",
+                border_style="yellow",
+            )
+        )
+        return tables
+
+    def _print_table_list(self, tables: list) -> None:
+        lines = []
+        for table in tables:
+            lines.append(f"  [bold]{table.name}[/bold]")
+            lines.append(f"    [dim]{table.purpose}[/dim]")
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold cyan]Derived tables[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # Endpoint list confirmation
+    # ------------------------------------------------------------------
+
+    def _confirm_endpoint_list(self, endpoints: list) -> list:
+        """Show method + path for each endpoint and let user confirm."""
+        self._print_endpoint_list(endpoints)
+
+        try:
+            confirmed = Confirm.ask(
+                "\n[bold]Confirm this endpoint list?[/bold]", default=True
+            )
+        except EOFError:
+            return endpoints
+
+        if confirmed:
+            return endpoints
+
+        console.print(
+            Panel(
+                "[yellow]Endpoints are derived from the features in the spec.\n"
+                "To adjust, edit spec/01_functional.md and re-run, or accept and\n"
+                "edit spec/03_api_contract.md directly after it is written.[/yellow]",
+                border_style="yellow",
+            )
+        )
+        return endpoints
+
+    def _print_endpoint_list(self, endpoints: list) -> None:
+        lines = []
+        for ep in endpoints:
+            auth_note = "" if ep.auth_required else " [dim][public][/dim]"
+            lines.append(
+                f"  [bold]{ep.method}[/bold] {ep.path}{auth_note}"
+                f"  [dim]-> {ep.feature_id}[/dim]"
+            )
+        console.print(
+            Panel(
+                "\n".join(lines),
+                title="[bold cyan]Derived endpoints[/bold cyan]",
+                border_style="cyan",
+            )
+        )
 
 
 class Phase4_Architecture:
@@ -570,15 +762,23 @@ class InterviewStateMachine:
 
             self._save_state(state)
 
-            # Post-phase hook: commit spec after Phase 2
+            # Post-phase commits
             if phase.name == "phase-2-features":
                 self._commit_spec(
                     [Path.cwd() / "spec" / "01_functional.md"],
                     "spec(phase-2): functional spec draft",
                 )
+            elif phase.name == "phase-3-data-api":
+                self._commit_spec(
+                    [
+                        Path.cwd() / "spec" / "02_data_model.md",
+                        Path.cwd() / "spec" / "03_api_contract.md",
+                    ],
+                    "spec(phase-3): data model + API contract",
+                )
 
-            # Stop once Phase 2 is complete (Phase 3+ not yet implemented)
-            if state.current_phase >= 2:
+            # Stop once Phase 3 is complete (Phase 4+ not yet implemented)
+            if state.current_phase >= 3:
                 break
 
         return state
@@ -591,7 +791,7 @@ class InterviewStateMachine:
         _persist_state(state, self._devos_dir)
 
     def _load_state(self) -> InterviewState | None:
-        from devos.planning.spec_generator import Feature
+        from devos.planning.spec_generator import Feature, Table, Endpoint
 
         path = self._devos_dir / "interview_state.json"
         if not path.exists():
@@ -605,12 +805,32 @@ class InterviewStateMachine:
                 try:
                     features.append(Feature(**f_data))
                 except Exception:
-                    pass  # Skip any malformed feature entries
+                    pass
+
+            # Restore confirmed tables
+            tables: list[Table] = []
+            for t_data in data.get("tables", []):
+                try:
+                    t_data.setdefault("out_of_scope", [])
+                    tables.append(Table(**t_data))
+                except Exception:
+                    pass
+
+            # Restore confirmed endpoints
+            endpoints: list[Endpoint] = []
+            for e_data in data.get("endpoints", []):
+                try:
+                    e_data.setdefault("purpose", "")
+                    e_data.setdefault("out_of_scope", [])
+                    endpoints.append(Endpoint(**e_data))
+                except Exception:
+                    pass
 
             loaded_phase = data.get("current_phase", 0)
 
-            # Sanity check: phase counter may have been inflated by old stubs.
-            # A phase is only truly done when it produced real output.
+            # Sanity check: phase counter is only valid when output was produced.
+            if loaded_phase >= 3 and not tables:
+                loaded_phase = 2  # Phase 3 was never actually completed
             if loaded_phase >= 2 and not features:
                 loaded_phase = 1  # Phase 2 was never actually completed
             if loaded_phase >= 1 and not data.get("vision"):
@@ -628,6 +848,8 @@ class InterviewStateMachine:
                 constraints=data.get("constraints", []),
                 current_phase=loaded_phase,
                 features=features,
+                tables=tables,
+                endpoints=endpoints,
             )
         except Exception:
             return None
