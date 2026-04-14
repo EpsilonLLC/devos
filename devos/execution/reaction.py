@@ -12,8 +12,12 @@ Auto-retry is not implemented — surface to user, require manual intervention.
 from __future__ import annotations
 
 import json
+import logging
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from rich.console import Console
 from rich.panel import Panel
@@ -90,6 +94,8 @@ class ReactionEngine:
             raise ReactionError(
                 f"Distillation failed for {task.id}: {exc}"
             ) from exc
+
+        _commit_worktree(session.worktree_path, task.id)
 
         if remove_worktree:
             try:
@@ -182,6 +188,54 @@ class ReactionEngine:
 
 
 # ── Private helpers ─────────────────────────────────────────────────────────────
+
+
+def _commit_worktree(worktree_path: str | Path, task_id: str) -> None:
+    """Stage and commit all agent output inside the worktree.
+
+    Runs ``git add -A`` then ``git commit`` so the agent's work is captured
+    in git history before the worktree directory is deleted.  If there is
+    nothing to commit (clean tree) the function returns silently.  Any git
+    failure is logged as a warning rather than raised — a failed commit must
+    not block the rest of on_complete.
+
+    Args:
+        worktree_path: Absolute path to the worktree root.
+        task_id:       Used in the commit message (e.g. ``T-001``).
+    """
+    wt = Path(worktree_path)
+    if not wt.exists():
+        logger.warning("_commit_worktree: worktree path does not exist: %s", wt)
+        return
+
+    try:
+        subprocess.run(
+            ["git", "add", "-A"],
+            cwd=wt,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        result = subprocess.run(
+            ["git", "commit", "-m", f"task({task_id}): agent output"],
+            cwd=wt,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode not in (0, 1):
+            # exit 1 from git commit means "nothing to commit" — not an error.
+            logger.warning(
+                "git commit in worktree %s exited %d: %s",
+                wt,
+                result.returncode,
+                result.stderr.strip(),
+            )
+        else:
+            logger.debug("Committed agent output in %s: %s", wt, result.stdout.strip())
+    except subprocess.CalledProcessError as exc:
+        logger.warning("git add -A failed in worktree %s: %s", wt, exc.stderr.strip())
+    except OSError as exc:
+        logger.warning("Could not run git in worktree %s: %s", wt, exc)
 
 
 def _append_event(events_path: Path, **fields: object) -> None:
