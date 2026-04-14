@@ -40,6 +40,7 @@ from devos.context.assembler import (  # noqa: E402
     ContextPackage,
     ContextBudgetExceededError,
     SessionDirectoryError,
+    TASK_DIRECTIVE,
 )
 from devos.context.distiller import (  # noqa: E402
     MemoryDistiller,
@@ -55,6 +56,7 @@ __all__ = [
     "MAX_EXCHANGES_PER_SESSION",
     "MAX_CONTEXT_TOKENS",
     "DISTILLED_SUMMARY_TARGET",
+    "TASK_DIRECTIVE",
     # Injector
     "ConstraintInjector",
     "ContextBlock",

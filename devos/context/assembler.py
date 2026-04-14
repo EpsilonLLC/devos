@@ -36,6 +36,11 @@ MAX_EXCHANGES_PER_SESSION: int = 25
 MAX_CONTEXT_TOKENS: int = 40_000
 DISTILLED_SUMMARY_TARGET: int = 200
 
+# ── Implementation directive ────────────────────────────────────────────────────
+# Prepended to every task.md at position 0 so agents begin writing immediately.
+# Defined here (single source of truth); re-exported from devos/context/__init__.py.
+TASK_DIRECTIVE: str = "Write all files now. Do not ask questions."
+
 
 # ── Exceptions ─────────────────────────────────────────────────────────────────
 
@@ -292,9 +297,12 @@ class ContextAssembler:
 def _render_task_md(task: Task) -> str:
     """Render a human- and agent-readable task.md from a Task dataclass.
 
+    TASK_DIRECTIVE is always the first line so agents begin writing immediately.
     No dynamic content (timestamps etc.) — deterministic for the same Task.
     """
     lines: list[str] = [
+        TASK_DIRECTIVE,
+        "",
         f"# Task: {task.id} — {task.name}",
         "",
         f"**Component:** {task.component}",

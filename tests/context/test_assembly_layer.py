@@ -37,6 +37,7 @@ from devos.context import (
     MAX_CONTEXT_TOKENS,
     MAX_FILES_PER_TASK,
     MAX_SPEC_SECTIONS_PER_TASK,
+    TASK_DIRECTIVE,
     ConstraintInjector,
     ConstraintsMissingError,
     ConstraintsViolationError,
@@ -589,3 +590,98 @@ def test_distiller_never_reads_spec_files_or_constraints(tmp_path):
     assert not hasattr(distiller, "constraints_path")
     assert not hasattr(distiller, "_constraints_path")
     assert not hasattr(distiller, "_spec_dir")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (q) task.md always starts with TASK_DIRECTIVE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_task_md_always_starts_with_directive(tmp_path):
+    """The task block content must begin with TASK_DIRECTIVE regardless of
+    what the task contains (no spec files, no relevant files, etc.)."""
+    repo_root = tmp_path / "repo"
+    devos_dir = tmp_path / ".devos"
+    repo_root.mkdir()
+
+    assembler = _make_assembler(repo_root, devos_dir)
+    task = _make_task()
+    pkg = assembler.assemble(task)
+
+    task_block = next(b for b in pkg.blocks if b.kind == "task")
+    assert task_block.content.startswith(TASK_DIRECTIVE), (
+        f"task.md must start with TASK_DIRECTIVE.\n"
+        f"Expected prefix: {TASK_DIRECTIVE!r}\n"
+        f"Actual start:    {task_block.content[:80]!r}"
+    )
+
+    # Also verify the written file on disk matches
+    task_file = pkg.session_dir / "task.md"
+    assert task_file.read_text(encoding="utf-8").startswith(TASK_DIRECTIVE)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (r) TASK_DIRECTIVE appears exactly once in task.md
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_task_md_directive_appears_exactly_once(tmp_path):
+    """TASK_DIRECTIVE must not be duplicated inside a single task.md."""
+    repo_root = tmp_path / "repo"
+    devos_dir = tmp_path / ".devos"
+    spec_dir = repo_root / "spec"
+    spec_dir.mkdir(parents=True)
+    (spec_dir / "main.md").write_text("# Spec\nsome content", encoding="utf-8")
+
+    assembler = _make_assembler(repo_root, devos_dir)
+    task = _make_task(
+        spec_files=["spec/main.md"],
+        depends_on=["T-000"],
+    )
+    pkg = assembler.assemble(task)
+
+    task_block = next(b for b in pkg.blocks if b.kind == "task")
+    count = task_block.content.count(TASK_DIRECTIVE)
+    assert count == 1, (
+        f"TASK_DIRECTIVE should appear exactly once in task.md; found {count} occurrence(s)."
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# (s) TASK_DIRECTIVE is never present in distilled summary output
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_directive_is_not_present_in_distilled_summary(tmp_path):
+    """The distiller's fixed six-section template has no slot for TASK_DIRECTIVE.
+
+    Two assertions:
+      1. The distiller's system prompt and summary template do not contain the
+         directive text — so even if an LLM tried to preserve it, the template
+         structure would not accommodate it.
+      2. When the distiller processes raw output that contains the directive,
+         the rendered_markdown it produces (mocked to a realistic template output)
+         does not contain the directive.
+
+    task.md always re-generates the directive at assemble() time, so the
+    directive survives not by being stored in summaries but by being injected
+    fresh into every task context package.
+    """
+    from devos.context.distiller import _SYSTEM_PROMPT, _SUMMARY_TEMPLATE
+
+    # Structural: the distiller prompt/template have no room for the directive.
+    assert TASK_DIRECTIVE not in _SYSTEM_PROMPT, (
+        "TASK_DIRECTIVE must not appear in the distiller system prompt."
+    )
+    assert TASK_DIRECTIVE not in _SUMMARY_TEMPLATE, (
+        "TASK_DIRECTIVE must not appear in the distiller summary template."
+    )
+
+    # Behavioural: mock distillation of raw output that contains the directive.
+    client = _make_mock_anthropic(_FULL_SUMMARY)
+    distiller = MemoryDistiller(client)
+    summary = distiller.distill(
+        "T-001",
+        "core module",
+        raw_output=TASK_DIRECTIVE + "\nagent wrote some files",
+    )
+    assert TASK_DIRECTIVE not in summary.rendered_markdown, (
+        "TASK_DIRECTIVE must not appear in a distilled summary."
+    )
