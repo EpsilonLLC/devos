@@ -172,48 +172,60 @@ class OutputCollector:
 
 
 def _list_worktree_files(worktree_path: Path) -> list[Path]:
-    """Return relative paths of files *modified* in the worktree vs HEAD.
+    """Return relative paths of files written or modified by the task.
 
-    Uses ``git diff --name-only HEAD`` so only files genuinely written or
-    changed by the task are returned — not inherited base-repo files that
-    exist in every worktree unchanged.
+    Combines two git commands to capture all task-produced files:
+      - ``git diff --name-only HEAD``       — tracked files modified vs base
+      - ``git ls-files --others --exclude-standard`` — new untracked files
 
-    If the worktree no longer exists, git is unavailable, or the command
+    Both lists are merged and deduplicated so new application code in
+    previously-nonexistent directories (e.g. ``devos/tasks/``) is included
+    alongside modifications to pre-existing tracked files.
+
+    If the worktree no longer exists, git is unavailable, or a command
     fails, an empty list is returned rather than raising.
 
     Args:
         worktree_path: Absolute path to the worktree root.
 
     Returns:
-        Sorted list of relative ``Path`` objects for modified files only.
+        Sorted list of relative ``Path`` objects for task-produced files only.
     """
     if not worktree_path.exists():
         return []
 
-    try:
-        result = subprocess.run(
-            ["git", "diff", "--name-only", "HEAD"],
-            cwd=worktree_path,
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            logger.warning(
-                "git diff failed in %s (rc=%d): %s",
-                worktree_path,
-                result.returncode,
-                result.stderr.strip(),
+    raw_names: set[str] = set()
+
+    _GIT_CMDS = [
+        ["git", "diff", "--name-only", "HEAD"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ]
+    for cmd in _GIT_CMDS:
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
             )
-            return []
-    except OSError as exc:
-        logger.warning("Could not run git diff in %s: %s", worktree_path, exc)
-        return []
+            if result.returncode != 0:
+                logger.warning(
+                    "%s failed in %s (rc=%d): %s",
+                    " ".join(cmd),
+                    worktree_path,
+                    result.returncode,
+                    result.stderr.strip(),
+                )
+                continue
+            for name in result.stdout.splitlines():
+                name = name.strip()
+                if name:
+                    raw_names.add(name)
+        except OSError as exc:
+            logger.warning("Could not run %s in %s: %s", " ".join(cmd), worktree_path, exc)
 
     files: list[Path] = []
-    for name in result.stdout.splitlines():
-        name = name.strip()
-        if not name:
-            continue
+    for name in raw_names:
         rel = Path(name)
         # Exclude .devos/ and .git/ subtrees (defensive; git normally won't
         # track these, but guard against unusual repo configurations).
