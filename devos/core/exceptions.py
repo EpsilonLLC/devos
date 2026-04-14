@@ -29,3 +29,7 @@ class Http404Error(AppException):
 class Http500Error(AppException):
     def __init__(self, message: str, detail: str = "") -> None:
         super().__init__(message, 500, detail)
+
+class Http409Error(AppException):
+    def __init__(self, message: str, detail: str = "") -> None:
+        super().__init__(message, 409, detail)

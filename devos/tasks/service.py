@@ -1,5 +1,5 @@
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,7 +68,7 @@ class TaskService:
         self._db = db
 
     async def create_task(self, user: User, payload: TaskCreateRequest) -> TaskResponse:
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         task = Task(
             id=uuid.uuid4(),
             tenant_id=user.tenant_id,
@@ -123,7 +123,7 @@ class TaskService:
         if task.user_id != user.id or task.tenant_id != user.tenant_id:
             raise TaskForbiddenError(str(task_id))
 
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
 
         if payload.title is not None:
             task.title = payload.title
@@ -171,7 +171,7 @@ class TaskService:
         if payload.status == task.status:
             return _task_to_response(task)
 
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         task.status = payload.status
         task.status_changed_at = now
         task.updated_at = now

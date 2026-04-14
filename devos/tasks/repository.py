@@ -1,5 +1,5 @@
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,7 +44,7 @@ class TaskRepository:
         return task
 
     async def soft_delete(self, task: Task) -> None:
-        task.deleted_at = datetime.now(UTC)
+        task.deleted_at = datetime.now(timezone.utc)
         await self._db.flush()
 
 
@@ -58,7 +58,7 @@ class TaskTagRepository:
         await self._db.flush()
 
     async def soft_delete_by_task(self, task_id: uuid.UUID) -> None:
-        now = datetime.now(UTC)
+        now = datetime.now(timezone.utc)
         await self._db.execute(
             update(TaskTag)
             .where(TaskTag.task_id == task_id, TaskTag.deleted_at.is_(None))
