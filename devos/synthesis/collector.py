@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -171,34 +172,53 @@ class OutputCollector:
 
 
 def _list_worktree_files(worktree_path: Path) -> list[Path]:
-    """Return relative paths of all files in worktree, excluding system dirs.
+    """Return relative paths of files *modified* in the worktree vs HEAD.
 
-    If the worktree no longer exists (removed by an earlier cleanup), an
-    empty list is returned rather than raising.
+    Uses ``git diff --name-only HEAD`` so only files genuinely written or
+    changed by the task are returned — not inherited base-repo files that
+    exist in every worktree unchanged.
+
+    If the worktree no longer exists, git is unavailable, or the command
+    fails, an empty list is returned rather than raising.
 
     Args:
         worktree_path: Absolute path to the worktree root.
 
     Returns:
-        Sorted list of relative ``Path`` objects.
+        Sorted list of relative ``Path`` objects for modified files only.
     """
     if not worktree_path.exists():
         return []
 
-    files: list[Path] = []
     try:
-        for entry in worktree_path.rglob("*"):
-            if not entry.is_file():
-                continue
-            try:
-                rel = entry.relative_to(worktree_path)
-            except ValueError:
-                continue
-            # Exclude .devos/ and .git/ subtrees.
-            if rel.parts and rel.parts[0] in _EXCLUDED_DIRS:
-                continue
-            files.append(rel)
+        result = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=worktree_path,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            logger.warning(
+                "git diff failed in %s (rc=%d): %s",
+                worktree_path,
+                result.returncode,
+                result.stderr.strip(),
+            )
+            return []
     except OSError as exc:
-        logger.warning("Error listing worktree files at %s: %s", worktree_path, exc)
+        logger.warning("Could not run git diff in %s: %s", worktree_path, exc)
+        return []
+
+    files: list[Path] = []
+    for name in result.stdout.splitlines():
+        name = name.strip()
+        if not name:
+            continue
+        rel = Path(name)
+        # Exclude .devos/ and .git/ subtrees (defensive; git normally won't
+        # track these, but guard against unusual repo configurations).
+        if rel.parts and rel.parts[0] in _EXCLUDED_DIRS:
+            continue
+        files.append(rel)
 
     return sorted(files)

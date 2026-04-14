@@ -1,4 +1,4 @@
-"""Claude Code adapter — non-interactive subprocess invocation.
+﻿"""Claude Code adapter — non-interactive subprocess invocation.
 
 Claude Code reads a task.md file from the context directory and writes its
 output to stdout.  Context delivery is filesystem-based; no interactive
@@ -55,8 +55,10 @@ class ClaudeCodeAdapter(AgentAdapter):
 
     def build_launch_command(self, context_path: Path) -> list[str]:
         """Return the command to run Claude Code non-interactively on task.md."""
+        import shutil as _shutil
+        claude_exe = _shutil.which("claude") or r"C:\Users\jmoli\.local\bin\claude.exe"
         return [
-            "claude",
+            claude_exe,
             "--print",
             "--dangerously-skip-permissions",
             str(context_path / "task.md"),
@@ -138,3 +140,5 @@ class ClaudeCodeAdapter(AgentAdapter):
             return False
         rc = entry.process.poll()
         return rc is not None and rc != 0
+
+

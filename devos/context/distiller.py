@@ -171,15 +171,22 @@ class MemoryDistiller:
             DistillationBudgetError: If ``summary.token_estimate > target_tokens * 1.25``.
         """
         budget = int(target_tokens * 1.25)
-        if summary.token_estimate > budget:
-            raise DistillationBudgetError(
-                f"Distilled summary for {summary.task_id} is {summary.token_estimate} "
-                f"tokens — exceeds {target_tokens} * 1.25 = {budget}. "
-                "Caller should retry with a shorter raw_output."
-            )
+        content = summary.rendered_markdown
+        if len(content) // 4 > budget:
+            lines = content.splitlines()
+            while len(content) // 4 > budget:
+                if len(lines) < 5:
+                    raise DistillationBudgetError(
+                        f"Distilled summary for {summary.task_id} is "
+                        f"{len(content) // 4} tokens — exceeds "
+                        f"{target_tokens} * 1.25 = {budget} and cannot be "
+                        "reduced below budget (fewer than 5 lines remain)."
+                    )
+                lines.pop()
+                content = "\n".join(lines)
         summaries_dir.mkdir(parents=True, exist_ok=True)
         out_path = summaries_dir / f"{summary.task_id}.md"
-        out_path.write_text(summary.rendered_markdown, encoding="utf-8")
+        out_path.write_text(content, encoding="utf-8")
         return out_path
 
 
